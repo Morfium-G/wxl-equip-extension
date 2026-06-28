@@ -32,8 +32,8 @@ Vanilla 3.3.5a only supports `ModelName_1`, `ModelName_2`, `ModelTexture_1`, and
 
 | Slot | Model1 | Model2 | Texture1 | Texture2 | Icon2 settings |
 |------|--------|--------|----------|----------|----------------|
-| Head | was partial | **added** | was partial | **added** | **added** |
-| Shoulder | was partial | **added** | was partial | **added** | **added** |
+| Head | was partial | **added** | - | **added** | **added** |
+| Shoulder | was partial | was partial | -  | - | **added** |
 | Shirt | **new** | **new** | **new** | **new** | **new** |
 | Chest | **new** | **new** | **new** | **new** | **new** |
 | Waist | **new** | **new** | **new** | **new** | **new** |
@@ -104,12 +104,6 @@ All three parts are optional. Omit a value to keep the slot default. Examples:
 | `0x10` | Append gender to texture | Append the gender code to the texture path. |
 | `0x20` | Model in subfolder | Place the model in a subfolder named after the base model (without suffixes). For example, `chestplate_paladin_tier2_HuF.mdx` resolves to `Item\ObjectComponent\Chest\chestplate_paladin_tier2\chestplate_paladin_tier2_HuF.mdx`. Texture paths follow the same subfolder. Useful for packaging models for easy distribution and merging. |
 | `0x40` | New suffix format | Use the retail naming convention with an extra underscore between race and gender: `Hu_F` instead of `HuF`. Only applies when the model or texture actually needs suffixing (i.e. `0x2`/`0x4` are not both set, or `0x8`/`0x10` are both set). Lets you use retail-exported models without renaming. |
-
----
-
-## Notes
-
-This does work for npcs wearing armor.
 
 ---
 
