@@ -52,10 +52,12 @@ namespace wxl::scripts::equipextension
     // Maps collection bone index → character bone index (0xFF = unmatched).
     // Built by 3-pass matching: (1a) key_bone_id raw scan, (1b) BoneIndicesByID LUT,
     // (1c) BoneNameCRC, then (2) parent-chain propagation.
+    // Retail collection M2s (full-body chest pieces etc.) routinely have 60-100+ bones;
+    // 48 was too small and caused the early-exit, leaving count=0 for all collection models.
     struct BoneRemap
     {
-        uint8_t count;
-        uint8_t collToChar[48];
+        uint16_t count;
+        uint8_t  collToChar[256];
     };
 
     // One attachment entry per attached M2. Keyed by CharModelObject pointer in g_attached.
@@ -211,8 +213,10 @@ namespace wxl::scripts::equipextension
             uint32_t charLutN = *reinterpret_cast<uint32_t*>(charHdr + m2::kOffHdrBoneIdxLutCount);
             int16_t* charLut  = *reinterpret_cast<int16_t**>(charHdr + m2::kOffHdrBoneIdxLutPtr);
 
-            if (!collBase || collN == 0 || collN > 48) return r;
-            r.count = static_cast<uint8_t>(collN);
+            EquipLog("  BuildBoneRemap: collN=%u charN=%u collBase=%p charBase=%p charLut=%p",
+                     collN, charN, collBase, charBase, charLut);
+            if (!collBase || collN == 0 || collN > 256) return r;
+            r.count = static_cast<uint16_t>(collN);
 
             // Pass 1a: match by key_bone_id scan of char bone array
             if (charBase)
