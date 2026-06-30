@@ -740,7 +740,13 @@ namespace wxl::scripts::equipextension
             if (e.texBuf[0])
             {
                 void* tex = gm2::LoadResource(e.texBuf, 0);
-                if (tex) { gm2::BindTexSlot(rctx, tex); gm2::ReleaseResource(tex); }
+                if (tex)
+                {
+                    gm2::BindTexSlot(rctx, tex);
+                    // Do not release here. TextureCreate returns a handle that the render context
+                    // continues to use after BindTexSlot; releasing immediately can recycle it and
+                    // leave the attached M2 sampling the client's missing-texture green.
+                }
             }
 
             // subObj->initFlags & 1: when set (character fully initialised), sub_831630 checks the
@@ -1128,7 +1134,11 @@ namespace wxl::scripts::equipextension
                             if (entry.texBuf[0])
                             {
                                 void* tex = gm2::LoadResource(entry.texBuf, 0);
-                                if (tex) { gm2::BindTexSlot(rctx, tex); gm2::ReleaseResource(tex); }
+                                if (tex)
+                                {
+                                    gm2::BindTexSlot(rctx, tex);
+                                    // Keep the texture handle alive for the attached render context.
+                                }
                             }
                             gm2::DetachSlot(entry.subObj, entry.attachId);
                             gm2::AttachToScene(rctx, entry.subObj, entry.attachId, entry.geoFilter.count > 0);
