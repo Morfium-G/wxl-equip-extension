@@ -112,6 +112,7 @@ namespace wxl::scripts::equipextension
         { "Cape",     12,  12, false, false }, // 9  BACK
         { "Tabard",   34,  34, false, false }, // 10 TABARD
     };
+    constexpr uint32_t kCollectionAttach = 19;
 
     // WoW C++ equip slot (0-18) → internal model slot. UINT32_MAX = not handled here.
     static const uint32_t kEquipToModelSlot[19] = {
@@ -320,6 +321,37 @@ namespace wxl::scripts::equipextension
         return f;
     }
 
+    static bool CopyListPart(const char* list, uint32_t index, char* out, size_t outSz)
+    {
+        if (outSz == 0) return false;
+        out[0] = '\0';
+        if (!list) return false;
+
+        const char* part = list;
+        uint32_t cur = 0;
+        for (;;)
+        {
+            const char* end = part;
+            while (*end && *end != ';') ++end;
+
+            if (cur == index)
+            {
+                while (part < end && (*part == ' ' || *part == '\t')) ++part;
+                while (end > part && (end[-1] == ' ' || end[-1] == '\t')) --end;
+                size_t len = static_cast<size_t>(end - part);
+                if (len >= outSz) len = outSz - 1;
+                if (len) std::memcpy(out, part, len);
+                out[len] = '\0';
+                return true;
+            }
+
+            if (!*end) break;
+            part = end + 1;
+            ++cur;
+        }
+        return false;
+    }
+
     static void ParseAttachField(const char* start, const char* end,
                                   uint32_t* leftOut, uint32_t* rightOut)
     {
@@ -377,6 +409,21 @@ namespace wxl::scripts::equipextension
             std::memcpy(customFolder, f4 + 1, len);
             customFolder[len] = '\0';
         }
+    }
+
+    static bool Icon2FieldHasValue(const char* icon2str, uint32_t fieldIndex)
+    {
+        if (!icon2str) return false;
+        const char* start = icon2str;
+        for (uint32_t i = 0; i < fieldIndex; ++i)
+        {
+            while (*start && *start != ':') ++start;
+            if (*start != ':') return false;
+            ++start;
+        }
+        const char* end = start;
+        while (*end && *end != ':') ++end;
+        return end > start;
     }
 
     // ─── Path builders ────────────────────────────────────────────────────────────
@@ -873,12 +920,18 @@ namespace wxl::scripts::equipextension
         uint32_t attachB_l = cfg.defAttach2, attachB_r = cfg.defAttach2;
         uint32_t icon2flags = 0;
         char customFolder[64] = {};
+        bool icon2AttachAExplicit = false;
+        bool icon2AttachBExplicit = false;
         // Guard pointer range before dereferencing: a raw integer in g_disp+0x18 could be a
         // small non-null value (GeosetGroup integer) that would AV if dereferenced directly.
         if (icon2str && reinterpret_cast<uintptr_t>(icon2str) > 0x10000
             && *icon2str && (*icon2str == ':' || (*icon2str >= '0' && *icon2str <= '9')))
+        {
+            icon2AttachAExplicit = Icon2FieldHasValue(icon2str, 0);
+            icon2AttachBExplicit = Icon2FieldHasValue(icon2str, 1);
             ParseIcon2(icon2str, &attachA_l, &attachA_r, &attachB_l, &attachB_r,
                        &icon2flags, customFolder, sizeof(customFolder));
+        }
 
         // Use left-side attach values (0x80 sided-slot selection not yet implemented).
         uint32_t attachA = attachA_l;
@@ -955,71 +1008,71 @@ namespace wxl::scripts::equipextension
             return ef;
         };
 
-        // Model 1
-        if (modelName1 && *modelName1)
+        auto attachForEntry = [](bool isCollection, uint32_t columnAttach, bool explicitAttach) -> uint32_t
         {
-            char stem1[264]; GeosetFilter geo1;
-            splitModelName(modelName1, stem1, sizeof(stem1), &geo1);
-            bool isCol1 = geo1.count > 0;
-            uint32_t ef1 = effectiveFlags(isCol1);
+            if (isCollection && !explicitAttach) return kCollectionAttach;
+            return columnAttach;
+        };
 
-            char m1Path[264];
-            BuildSlotPath(m1Path, stem1, raceCode, genderStr, ef1, cfg.folder, isCol1, customFolder);
-
-            char texPath1[264] = {};
-            if (texName1 && *texName1)
-                BuildTexPath(texPath1, sizeof(texPath1), texName1, raceCode, genderStr,
-                             ef1, cfg.folder, isCol1, customFolder, stem1);
-
-            EquipLog("  M1: attach=%u path='%s' tex='%s' geoCount=%u",
-                     attachA, m1Path, texPath1[0] ? texPath1 : "(none)", geo1.count);
-
-            AttachEntry e1 = {};
-            e1.equipSlot = a.modelSlot;
-            e1.attachId  = attachA;
-            e1.subObj    = subObj;
-            std::memcpy(e1.keyBuf, m1Path,   sizeof(e1.keyBuf));
-            std::memcpy(e1.texBuf, texPath1, sizeof(e1.texBuf));
-            e1.geoFilter = geo1;
-            g_attached[cmo].push_back(e1);
-        }
-        else
+        auto addModelList = [&](const char* label, const char* modelList, const char* texList,
+                                uint32_t columnAttach, bool explicitAttach)
         {
-            EquipLog("  M1: no model name, skip");
-        }
+            bool anyModel = false;
+            for (uint32_t idx = 0; idx < 16; ++idx)
+            {
+                char modelPart[264] = {};
+                if (!CopyListPart(modelList, idx, modelPart, sizeof(modelPart))) break;
+                if (!modelPart[0]) continue;
+                anyModel = true;
 
-        // Model 2
-        if (modelName2 && *modelName2 && attachB != static_cast<uint32_t>(-1))
-        {
-            char stem2[264]; GeosetFilter geo2;
-            splitModelName(modelName2, stem2, sizeof(stem2), &geo2);
-            bool isCol2 = geo2.count > 0;
-            uint32_t ef2 = effectiveFlags(isCol2);
+                char texPart[264] = {};
+                if (!CopyListPart(texList, idx, texPart, sizeof(texPart)))
+                    CopyListPart(texList, 0, texPart, sizeof(texPart));
 
-            char m2Path[264];
-            BuildSlotPath(m2Path, stem2, raceCode, genderStr, ef2, cfg.folder, isCol2, customFolder);
+                char stem[264]; GeosetFilter geo;
+                splitModelName(modelPart, stem, sizeof(stem), &geo);
+                if (!stem[0])
+                {
+                    EquipLog("  %s[%u]: empty stem after split, skip", label, idx);
+                    continue;
+                }
 
-            char texPath2[264] = {};
-            if (texName2 && *texName2)
-                BuildTexPath(texPath2, sizeof(texPath2), texName2, raceCode, genderStr,
-                             ef2, cfg.folder, isCol2, customFolder, stem2);
+                const bool isCollection = geo.count > 0;
+                const uint32_t ef = effectiveFlags(isCollection);
+                const uint32_t attach = attachForEntry(isCollection, columnAttach, explicitAttach);
+                if (attach == static_cast<uint32_t>(-1))
+                {
+                    EquipLog("  %s[%u]: attach==-1, skip", label, idx);
+                    continue;
+                }
 
-            EquipLog("  M2: attach=%u path='%s' tex='%s' geoCount=%u",
-                     attachB, m2Path, texPath2[0] ? texPath2 : "(none)", geo2.count);
+                char modelPath[264];
+                BuildSlotPath(modelPath, stem, raceCode, genderStr, ef, cfg.folder,
+                              isCollection, customFolder);
 
-            AttachEntry e2 = {};
-            e2.equipSlot = a.modelSlot;
-            e2.attachId  = attachB;
-            e2.subObj    = subObj;
-            std::memcpy(e2.keyBuf, m2Path,   sizeof(e2.keyBuf));
-            std::memcpy(e2.texBuf, texPath2, sizeof(e2.texBuf));
-            e2.geoFilter = geo2;
-            g_attached[cmo].push_back(e2);
-        }
-        else
-        {
-            EquipLog("  M2: no model name or attachB==-1, skip");
-        }
+                char texPath[264] = {};
+                if (texPart[0])
+                    BuildTexPath(texPath, sizeof(texPath), texPart, raceCode, genderStr,
+                                 ef, cfg.folder, isCollection, customFolder, stem);
+
+                EquipLog("  %s[%u]: attach=%u path='%s' tex='%s' geoCount=%u",
+                         label, idx, attach, modelPath, texPath[0] ? texPath : "(none)", geo.count);
+
+                AttachEntry e = {};
+                e.equipSlot = a.modelSlot;
+                e.attachId  = attach;
+                e.subObj    = subObj;
+                std::memcpy(e.keyBuf, modelPath, sizeof(e.keyBuf));
+                std::memcpy(e.texBuf, texPath,   sizeof(e.texBuf));
+                e.geoFilter = geo;
+                g_attached[cmo].push_back(e);
+            }
+
+            if (!anyModel) EquipLog("  %s: no model name, skip", label);
+        };
+
+        addModelList("M1", modelName1, texName1, attachA, icon2AttachAExplicit);
+        addModelList("M2", modelName2, texName2, attachB, icon2AttachBExplicit);
 
         EquipLog("  calling RebuildAllModels");
         RebuildAllModels(cmo);
