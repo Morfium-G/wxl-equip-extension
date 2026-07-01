@@ -72,6 +72,7 @@ namespace wxl::scripts::equipextension
         char        texBuf[264] = {};    // BLP path for BindTexSlot on re-attach
         GeosetFilter geoFilter  = {};
         BoneRemap    boneRemap  = {};
+        uint32_t    mergeKey = 0; // non-zero keeps logical semicolon collection models separate
         bool        perFrameLogged    = false; // suppress repeated per-frame noise after first log
         bool        charSweepApplied = false; // set when character-model PerFrame sweep first copies bones
         bool        bbpLogDone       = false; // suppress OnBuildBonePalette remap dump after first fire
@@ -113,6 +114,7 @@ namespace wxl::scripts::equipextension
         { "Tabard",   34,  34, false, false }, // 10 TABARD
     };
     constexpr uint32_t kCollectionAttach = 19;
+    constexpr uint32_t kFlagForceModelRaceGender = 0x80;
 
     // WoW C++ equip slot (0-18) → internal model slot. UINT32_MAX = not handled here.
     static const uint32_t kEquipToModelSlot[19] = {
@@ -152,6 +154,14 @@ namespace wxl::scripts::equipextension
         va_end(ap);
         std::fputc('\n', f);
         std::fclose(f);
+    }
+
+    static bool SameAttachModelGroup(const AttachEntry& a, const AttachEntry& b) noexcept
+    {
+        return a.mergeKey == b.mergeKey &&
+               a.attachId == b.attachId &&
+               std::strcmp(a.keyBuf, b.keyBuf) == 0 &&
+               std::strcmp(a.texBuf, b.texBuf) == 0;
     }
 
     // ─── SEH helpers (no C++ objects — safe to use __try/__except) ───────────────
@@ -303,7 +313,8 @@ namespace wxl::scripts::equipextension
 
     // flags: 0x1=hide geoset, 0x2=no gender, 0x4=no race,
     //        0x8=append race to tex, 0x10=append gender to tex,
-    //        0x20=model in subfolder, 0x40=new _Hu_F suffix
+    //        0x20=model in subfolder, 0x40=new _Hu_F suffix,
+    //        0x80=force model race/gender suffix
 
     static GeosetFilter ParseGeosetFilter(const char* spec)
     {
@@ -426,10 +437,57 @@ namespace wxl::scripts::equipextension
         return end > start;
     }
 
+    static bool StartsWithCI(const char* s, const char* prefix) noexcept
+    {
+        if (!s || !prefix) return false;
+        while (*prefix)
+        {
+            char a = *s++;
+            char b = *prefix++;
+            if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+            if (a != b) return false;
+        }
+        return true;
+    }
+
+    static const char* InferObjectComponentFolder(const char* name, bool isCollection,
+                                                  const char* customFolder,
+                                                  const char* slotFolder) noexcept
+    {
+        if (customFolder && *customFolder) return customFolder;
+        if (isCollection) return "Collections";
+        if (StartsWithCI(name, "cape_")) return "Cape";
+        if (StartsWithCI(name, "tabard_")) return "Tabard";
+        return slotFolder;
+    }
+
+    static uint32_t InferObjectComponentAttach(const char* name, bool isCollection,
+                                               bool explicitAttach,
+                                               uint32_t attach) noexcept
+    {
+        if (explicitAttach || isCollection) return attach;
+        if (StartsWithCI(name, "cape_")) return 12;
+        if (StartsWithCI(name, "tabard_")) return 34;
+        return attach;
+    }
+
+    static void AnalyzeModelList(const char* list, bool* hasCollection, bool* hasNormal)
+    {
+        char part[264] = {};
+        for (uint32_t idx = 0; idx < 16; ++idx)
+        {
+            if (!CopyListPart(list, idx, part, sizeof(part))) break;
+            if (!part[0]) continue;
+            if (std::strchr(part, ':')) *hasCollection = true;
+            else                        *hasNormal = true;
+        }
+    }
+
     // ─── Path builders ────────────────────────────────────────────────────────────
 
     // Builds the virtual M2 path: "Item\ObjectComponents\<folder>\[<stem>\]<stem>_<race>[_]<gender>.mdx"
-    // Folder priority: customFolder > (isCollection ? "Collections" : slotFolder).
+    // Folder priority: customFolder > collection/cape stem inference > slotFolder.
     // flags: 0x2=no gender, 0x4=no race, 0x20=subfolder, 0x40=new _Hu_F underscore between race+gender.
     static void BuildSlotPath(char* buf, const char* modelName,
                                const char* raceCode, const char* genderStr,
@@ -441,9 +499,7 @@ namespace wxl::scripts::equipextension
         bool subFolder    = (flags & 0x20) != 0;
         bool newSuffix    = (flags & 0x40) != 0;
 
-        const char* folder = slotFolder;
-        if (customFolder && *customFolder) folder = customFolder;
-        else if (isCollection)             folder = "Collections";
+        const char* folder = InferObjectComponentFolder(modelName, isCollection, customFolder, slotFolder);
 
         char* p = buf;
         for (const char* s = "Item\\ObjectComponents\\"; *s; ) *p++ = *s++;
@@ -487,11 +543,8 @@ namespace wxl::scripts::equipextension
         bool subFolder    = (flags & 0x20) != 0;
         bool newSuffix    = (flags & 0x40) != 0;
 
-        const char* folder = slotFolder;
-        if (customFolder && *customFolder) folder = customFolder;
-        else if (isCollection)             folder = "Collections";
-
         const char* subBase = (modelStem && *modelStem) ? modelStem : texName;
+        const char* folder = InferObjectComponentFolder(subBase, isCollection, customFolder, slotFolder);
         size_t subBaseLen = std::strlen(subBase);
         for (const char* s = subBase; *s; s++)
             if (*s == '.') { subBaseLen = static_cast<size_t>(s - subBase); break; }
@@ -644,9 +697,7 @@ namespace wxl::scripts::equipextension
             for (size_t j = 0; j < i; ++j)
             {
                 AttachEntry& prev = entries[j];
-                if (prev.geoFilter.count > 0 && prev.attachId == e.attachId &&
-                    std::strcmp(prev.keyBuf, e.keyBuf) == 0 &&
-                    std::strcmp(prev.texBuf,  e.texBuf)  == 0) { done = true; break; }
+                if (prev.geoFilter.count > 0 && SameAttachModelGroup(prev, e)) { done = true; break; }
             }
             if (done) continue;
 
@@ -655,9 +706,7 @@ namespace wxl::scripts::equipextension
             uint16_t mergedIds[16]; uint32_t mergedCount = 0;
             for (auto& e2 : entries)
             {
-                if (e2.geoFilter.count == 0 || e2.attachId != e.attachId ||
-                    std::strcmp(e2.keyBuf, e.keyBuf) != 0 ||
-                    std::strcmp(e2.texBuf,  e.texBuf)  != 0) continue;
+                if (e2.geoFilter.count == 0 || !SameAttachModelGroup(e2, e)) continue;
                 for (uint32_t fi = 0; fi < e2.geoFilter.count && mergedCount < 16; ++fi)
                 {
                     bool dup = false;
@@ -669,16 +718,15 @@ namespace wxl::scripts::equipextension
 
             // Build the virtual key and ensure bytes are in the serve table.
             char mangled[264];
-            VPathBuildKey(mangled, sizeof(mangled), cmo, e.keyBuf, mergedIds, mergedCount, e.texBuf);
-            VPathPopulate(cmo, e.keyBuf, mergedIds, mergedCount, e.texBuf);
-            EquipLog("  VPath: '%s' tex='%s' -> '%s' (merged=%u)", e.keyBuf, e.texBuf, mangled, mergedCount);
+            VPathBuildKey(mangled, sizeof(mangled), cmo, e.keyBuf, mergedIds, mergedCount, e.texBuf, e.mergeKey);
+            VPathPopulate(cmo, e.keyBuf, mergedIds, mergedCount, e.texBuf, e.mergeKey);
+            EquipLog("  VPath: '%s' tex='%s' -> '%s' (merged=%u mergeKey=0x%X)",
+                     e.keyBuf, e.texBuf, mangled, mergedCount, e.mergeKey);
 
             // Propagate the mangled key to all entries in this (keyBuf, attachId, texBuf) group.
             for (auto& e2 : entries)
             {
-                if (e2.geoFilter.count > 0 && e2.attachId == e.attachId &&
-                    std::strcmp(e2.keyBuf, e.keyBuf) == 0 &&
-                    std::strcmp(e2.texBuf,  e.texBuf)  == 0)
+                if (e2.geoFilter.count > 0 && SameAttachModelGroup(e2, e))
                     std::memcpy(e2.mangledKeyBuf, mangled, sizeof(e2.mangledKeyBuf));
             }
         }
@@ -711,9 +759,7 @@ namespace wxl::scripts::equipextension
             for (size_t j = i; j < entries.size(); ++j)
             {
                 AttachEntry& e2 = entries[j];
-                if (!e2.renderCtx && e2.attachId == e.attachId &&
-                    std::strcmp(e2.keyBuf, e.keyBuf) == 0 &&
-                    std::strcmp(e2.texBuf,  e.texBuf)  == 0)
+                if (!e2.renderCtx && SameAttachModelGroup(e2, e))
                     e2.renderCtx = rctx;
             }
         }
@@ -761,10 +807,7 @@ namespace wxl::scripts::equipextension
                 for (size_t j = i + 1; j < entries.size(); ++j)
                 {
                     AttachEntry& e2 = entries[j];
-                    if (!e2.renderCtx && e2.geoFilter.count > 0 &&
-                        e2.attachId == e.attachId &&
-                        std::strcmp(e2.keyBuf, e.keyBuf) == 0 &&
-                        std::strcmp(e2.texBuf,  e.texBuf)  == 0)
+                    if (!e2.renderCtx && e2.geoFilter.count > 0 && SameAttachModelGroup(e2, e))
                         e2.renderCtx = rctx;
                 }
             }
@@ -774,9 +817,7 @@ namespace wxl::scripts::equipextension
             for (size_t j = 0; j < i; ++j)
             {
                 AttachEntry& prev = entries[j];
-                if (prev.renderCtx && prev.attachId == e.attachId &&
-                    std::strcmp(prev.keyBuf, e.keyBuf) == 0 &&
-                    std::strcmp(prev.texBuf,  e.texBuf)  == 0)
+                if (prev.renderCtx && SameAttachModelGroup(prev, e))
                 { alreadyAttached = true; break; }
             }
             if (alreadyAttached) continue;
@@ -811,9 +852,7 @@ namespace wxl::scripts::equipextension
             // Propagate boneRemap to siblings sharing (keyBuf, attachId, texBuf).
             for (auto& e2 : entries)
             {
-                if (e2.attachId != e.attachId ||
-                    std::strcmp(e2.keyBuf, e.keyBuf) != 0 ||
-                    std::strcmp(e2.texBuf,  e.texBuf)  != 0) continue;
+                if (!SameAttachModelGroup(e2, e)) continue;
                 if (remap.count > 0) e2.boneRemap = remap;
             }
 
@@ -823,9 +862,7 @@ namespace wxl::scripts::equipextension
                 GeosetFilter merged = {};
                 for (auto& e2 : entries)
                 {
-                    if (e2.attachId != e.attachId ||
-                        std::strcmp(e2.keyBuf, e.keyBuf) != 0 ||
-                        std::strcmp(e2.texBuf,  e.texBuf)  != 0) continue;
+                    if (!SameAttachModelGroup(e2, e)) continue;
                     for (uint32_t fi = 0; fi < e2.geoFilter.count && merged.count < 16; ++fi)
                     {
                         bool dup = false;
@@ -995,6 +1032,12 @@ namespace wxl::scripts::equipextension
             else { std::strncpy(stemOut, name, stemSz - 1); stemOut[stemSz - 1] = '\0'; }
         };
 
+        bool rowHasCollection = false;
+        bool rowHasNormal = false;
+        AnalyzeModelList(modelName1, &rowHasCollection, &rowHasNormal);
+        AnalyzeModelList(modelName2, &rowHasCollection, &rowHasNormal);
+        const bool mixedCollectionRow = rowHasCollection && rowHasNormal;
+
         // Effective path flags: collection models always use race+gender; normal models use slot defaults.
         // Icon2 flags 0x2/0x4 can still suppress race/gender regardless.
         auto effectiveFlags = [&](bool isCollection) -> uint32_t
@@ -1002,20 +1045,27 @@ namespace wxl::scripts::equipextension
             uint32_t ef = icon2flags;
             if (!isCollection)
             {
-                if (!cfg.defUseRace)   ef |= 0x4;
-                if (!cfg.defUseGender) ef |= 0x2;
+                const bool forceModelRaceGender =
+                    (ef & kFlagForceModelRaceGender) || ((ef & 0x40) && !mixedCollectionRow);
+                if (!forceModelRaceGender)
+                {
+                    if (!cfg.defUseRace)   ef |= 0x4;
+                    if (!cfg.defUseGender) ef |= 0x2;
+                }
             }
             return ef;
         };
 
-        auto attachForEntry = [](bool isCollection, uint32_t columnAttach, bool explicitAttach) -> uint32_t
+        auto attachForEntry = [](bool isCollection, bool mixedRow, uint32_t columnAttach,
+                                 uint32_t defaultAttach, bool explicitAttach) -> uint32_t
         {
+            if (mixedRow) return isCollection ? kCollectionAttach : defaultAttach;
             if (isCollection && !explicitAttach) return kCollectionAttach;
             return columnAttach;
         };
 
         auto addModelList = [&](const char* label, const char* modelList, const char* texList,
-                                uint32_t columnAttach, bool explicitAttach)
+                                uint32_t columnAttach, uint32_t defaultAttach, bool explicitAttach)
         {
             bool anyModel = false;
             for (uint32_t idx = 0; idx < 16; ++idx)
@@ -1039,7 +1089,9 @@ namespace wxl::scripts::equipextension
 
                 const bool isCollection = geo.count > 0;
                 const uint32_t ef = effectiveFlags(isCollection);
-                const uint32_t attach = attachForEntry(isCollection, columnAttach, explicitAttach);
+                uint32_t attach = attachForEntry(isCollection, mixedCollectionRow, columnAttach,
+                                                 defaultAttach, explicitAttach);
+                attach = InferObjectComponentAttach(stem, isCollection, explicitAttach, attach);
                 if (attach == static_cast<uint32_t>(-1))
                 {
                     EquipLog("  %s[%u]: attach==-1, skip", label, idx);
@@ -1065,14 +1117,20 @@ namespace wxl::scripts::equipextension
                 std::memcpy(e.keyBuf, modelPath, sizeof(e.keyBuf));
                 std::memcpy(e.texBuf, texPath,   sizeof(e.texBuf));
                 e.geoFilter = geo;
+                if (isCollection && mixedCollectionRow)
+                    e.mergeKey = ((a.modelSlot + 1) << 16) |
+                                 ((label && label[1] == '1' ? 1u : 2u) << 8) |
+                                 (idx & 0xFFu);
+                if (e.mergeKey)
+                    EquipLog("  %s[%u]: isolated collection mergeKey=0x%X", label, idx, e.mergeKey);
                 g_attached[cmo].push_back(e);
             }
 
             if (!anyModel) EquipLog("  %s: no model name, skip", label);
         };
 
-        addModelList("M1", modelName1, texName1, attachA, icon2AttachAExplicit);
-        addModelList("M2", modelName2, texName2, attachB, icon2AttachBExplicit);
+        addModelList("M1", modelName1, texName1, attachA, cfg.defAttach1, icon2AttachAExplicit);
+        addModelList("M2", modelName2, texName2, attachB, cfg.defAttach2, icon2AttachBExplicit);
 
         EquipLog("  calling RebuildAllModels");
         RebuildAllModels(cmo);
