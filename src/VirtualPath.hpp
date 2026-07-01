@@ -24,7 +24,7 @@ namespace wxl::scripts::equipextension
     /**
      * @brief Builds the virtual .mdx key for a collection M2 into out[outSz].
      *
-     * Format: <stem>_wxl_<sorted_geosets>_tex_<texbasename>_cmo<HEX>.mdx
+     * Format: <stem>_wxl_<sorted_geosets>_tex_<texbasename>[_grp<HEX>]_cmo<HEX>.mdx
      * geoIds are sorted ascending internally; caller need not sort them.
      * @param out         destination buffer
      * @param outSz       destination buffer size in bytes
@@ -33,12 +33,14 @@ namespace wxl::scripts::equipextension
      * @param geoIds      geoset IDs included in the filter (unsorted)
      * @param geoCount    number of IDs
      * @param texPath     full BLP path for the texture slot (may be empty)
+     * @param variantKey  optional logical-model discriminator for entries that must not share cache keys
      * @return number of characters written (excluding null), or 0 on truncation
      */
     size_t VPathBuildKey(char* out, size_t outSz, void* cmo,
                          const char* realMdxPath,
                          const uint16_t* geoIds, uint32_t geoCount,
-                         const char* texPath);
+                         const char* texPath,
+                         uint32_t variantKey = 0);
 
     /**
      * @brief Ensures the virtual .mdx and .skin bytes are in the client serve table.
@@ -51,10 +53,12 @@ namespace wxl::scripts::equipextension
      * @param geoIds      geoset IDs (unsorted)
      * @param geoCount    number of IDs
      * @param texPath     full BLP path for the texture slot (may be empty)
+     * @param variantKey  optional logical-model discriminator for entries that must not share cache keys
      */
     void VPathPopulate(void* cmo, const char* realMdxPath,
                        const uint16_t* geoIds, uint32_t geoCount,
-                       const char* texPath);
+                       const char* texPath,
+                       uint32_t variantKey = 0);
 
     /**
      * @brief Removes all virtual table entries owned by cmo.

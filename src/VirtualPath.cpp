@@ -2,8 +2,8 @@
 //
 // Virtual paths encode (cmo × model × merged-geoset-filter × texture) in the filename so the
 // engine's model hash table sees a distinct cache key for every unique combination. The host
-// serve hook is bypassed; bytes are served directly from an in-process table. Filtering is still
-// applied by OnM2SkinFinalize on the parsed rawTri — we serve the unmodified real file bytes.
+// serve hook is bypassed; bytes are served directly from an in-process table. Collection skins are
+// also prefiltered here so synchronous skin loads receive the same geoset-trimmed data.
 //
 // Copyright (C) 2026 WarcraftXL
 //
@@ -98,12 +98,13 @@ namespace wxl::scripts::equipextension
         }
 
         // Builds the virtual .m2 key (sortedIds must already be sorted ascending).
-        // Format: <stem>_wxl_<id0>_<id1>..._tex_<texbasename>_cmo<hex>.m2  (all lowercase)
+        // Format: <stem>_wxl_<id0>_<id1>..._tex_<texbasename>[_grp<hex>]_cmo<hex>.m2  (all lowercase)
         // The engine normalises all paths to lowercase and uses .m2; keys must match that form.
         static size_t BuildKey(char* out, size_t outSz, void* cmo,
                                 const char* realMdxPath,
                                 const uint16_t* sortedIds, uint32_t idCount,
-                                const char* texPath) noexcept
+                                const char* texPath,
+                                uint32_t variantKey) noexcept
         {
             if (!out || outSz == 0) return 0;
             char* q   = out;
@@ -137,6 +138,12 @@ namespace wxl::scripts::equipextension
 
                 for (const char* s = "_tex_"; *s && q < end; ) *q++ = *s++;
                 for (const char* p = base; p < baseEnd && q < end; ) *q++ = LowerAscii(*p++);
+            }
+
+            if (variantKey != 0)
+            {
+                for (const char* s = "_grp"; *s && q < end; ) *q++ = *s++;
+                q = WriteHex(q, end, variantKey);
             }
 
             // _cmo<hex> (lowercase)
@@ -201,6 +208,64 @@ namespace wxl::scripts::equipextension
             RealSkinPath(out, outSz, virtualM2Key); // same operation: strip extension, append 00.skin
         }
 
+        static uint16_t ReadU16(const std::vector<uint8_t>& bytes, size_t off) noexcept
+        {
+            return static_cast<uint16_t>(bytes[off] | (bytes[off + 1] << 8));
+        }
+
+        static uint32_t ReadU32(const std::vector<uint8_t>& bytes, size_t off) noexcept
+        {
+            return static_cast<uint32_t>(bytes[off])
+                 | (static_cast<uint32_t>(bytes[off + 1]) << 8)
+                 | (static_cast<uint32_t>(bytes[off + 2]) << 16)
+                 | (static_cast<uint32_t>(bytes[off + 3]) << 24);
+        }
+
+        static bool ContainsId(const uint16_t* ids, uint32_t count, uint16_t value) noexcept
+        {
+            for (uint32_t i = 0; i < count; ++i)
+                if (ids[i] == value) return true;
+            return false;
+        }
+
+        static void ApplySkinByteFilter(std::vector<uint8_t>& skinBytes,
+                                        const uint16_t* geoIds,
+                                        uint32_t geoCount) noexcept
+        {
+            if (geoCount == 0 || skinBytes.size() < 0x2C) return;
+            if (std::memcmp(skinBytes.data(), "SKIN", 4) != 0) return;
+
+            const uint32_t rawIndexCount = ReadU32(skinBytes, 0x0C);
+            const uint32_t rawIndexOfs   = ReadU32(skinBytes, 0x10);
+            const uint32_t submeshCount  = ReadU32(skinBytes, 0x1C);
+            const uint32_t submeshOfs    = ReadU32(skinBytes, 0x20);
+            if (rawIndexOfs > skinBytes.size() || submeshOfs > skinBytes.size()) return;
+            if (rawIndexCount > (skinBytes.size() - rawIndexOfs) / sizeof(uint16_t)) return;
+            if (submeshCount > (skinBytes.size() - submeshOfs) / 0x30) return;
+
+            uint32_t kept = 0;
+            uint32_t zeroed = 0;
+            for (uint32_t si = 0; si < submeshCount; ++si)
+            {
+                const size_t sub = submeshOfs + si * 0x30;
+                const uint16_t sectionId = ReadU16(skinBytes, sub + 0x00);
+                const uint16_t indexStart = ReadU16(skinBytes, sub + 0x08);
+                const uint16_t indexCount = ReadU16(skinBytes, sub + 0x0A);
+                if (indexCount == 0 || indexStart + indexCount > rawIndexCount) continue;
+                if (sectionId == 0 || ContainsId(geoIds, geoCount, sectionId))
+                {
+                    ++kept;
+                    continue;
+                }
+
+                std::memset(skinBytes.data() + rawIndexOfs + indexStart * sizeof(uint16_t),
+                            0,
+                            indexCount * sizeof(uint16_t));
+                ++zeroed;
+            }
+            VPathLog("  VPathPopulate: prefiltered skin kept=%u zeroed=%u", kept, zeroed);
+        }
+
         // Produces a lowercase .m2 path from a (possibly mixed-case, .mdx-extension) DBC path.
         // The host stores loose files as lowercase .m2; ReadGameFile must use that form.
         static void NormalizeRealPath(char* out, size_t outSz, const char* src) noexcept
@@ -245,18 +310,20 @@ namespace wxl::scripts::equipextension
     size_t VPathBuildKey(char* out, size_t outSz, void* cmo,
                          const char* realMdxPath,
                          const uint16_t* geoIds, uint32_t geoCount,
-                         const char* texPath)
+                         const char* texPath,
+                         uint32_t variantKey)
     {
         uint16_t sorted[16];
         uint32_t n = geoCount < 16 ? geoCount : 16;
         for (uint32_t i = 0; i < n; ++i) sorted[i] = geoIds[i];
         SortIds(sorted, n);
-        return BuildKey(out, outSz, cmo, realMdxPath, sorted, n, texPath);
+        return BuildKey(out, outSz, cmo, realMdxPath, sorted, n, texPath, variantKey);
     }
 
     void VPathPopulate(void* cmo, const char* realMdxPath,
                        const uint16_t* geoIds, uint32_t geoCount,
-                       const char* texPath)
+                       const char* texPath,
+                       uint32_t variantKey)
     {
         uint16_t sorted[16];
         uint32_t n = geoCount < 16 ? geoCount : 16;
@@ -265,7 +332,7 @@ namespace wxl::scripts::equipextension
 
         // Build virtual .mdx key.
         char vMdx[264];
-        if (!BuildKey(vMdx, sizeof(vMdx), cmo, realMdxPath, sorted, n, texPath)) return;
+        if (!BuildKey(vMdx, sizeof(vMdx), cmo, realMdxPath, sorted, n, texPath, variantKey)) return;
 
         // No-op if already populated (same permutation on a re-equip cycle).
         if (g_virtualBytes.count(vMdx)) return;
@@ -293,6 +360,8 @@ namespace wxl::scripts::equipextension
         RealSkinPath(rSkin, sizeof(rSkin), normPath);
         std::vector<uint8_t> skinBytes;
         ReadGameFile(rSkin, skinBytes); // skin may be absent for some models; that is OK
+        if (!skinBytes.empty())
+            ApplySkinByteFilter(skinBytes, sorted, n);
         VPathLog("  VPathPopulate: skin '%s' -> %zu bytes", rSkin, skinBytes.size());
         VPathLog("  VPathPopulate: vMdx='%s'", vMdx);
         VPathLog("  VPathPopulate: vSkin='%s'", vSkin);
